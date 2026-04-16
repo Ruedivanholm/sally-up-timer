@@ -385,4 +385,109 @@ private fun loadCues(context: Context): List<Cue> {
             Cue(ms, cmd)
         }
         .sortedBy { it.atMs }
+        import android.annotation.SuppressLint
+import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.viewinterop.AndroidView
+
+@SuppressLint("SetJavaScriptEnabled")
+@Composable
+fun YouTubeIFrameWebView(
+    videoId: String,
+    modifier: Modifier = Modifier,
+    onCurrentSecond: (Float) -> Unit = {}
+) {
+    val html = remember(videoId) {
+        """
+        <!DOCTYPE html>
+        <html>
+          <head>
+            <meta name="referrer" content="strict-origin-when-cross-origin">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+              html, body { margin:0; padding:0; background:#000; height:100%; }
+              #player { position:absolute; top:0; left:0; right:0; bottom:0; }
+            </style>
+          </head>
+          <body>
+            <div id="player"></div>
+
+            https://www.youtube.com/iframe_apiscript>
+            <script>
+              var player;
+
+              function onYouTubeIframeAPIReady() {
+                player = new YT.Player('player', {
+                  videoId: '$videoId',
+                  playerVars: {
+                    autoplay: 1,
+                    controls: 1,
+                    playsinline: 1,
+                    enablejsapi: 1,
+                    rel: 0
+                  },
+                  events: {
+                    'onReady': function(e) {
+                      // Start playing
+                      e.target.playVideo();
+
+                      // Push time to Android 5x/sec
+                      setInterval(function() {
+                        try {
+                          var t = player.getCurrentTime();
+                          AndroidTime.onTime(t);
+                        } catch (err) {}
+                      }, 200);
+                    },
+                    'onError': function(err) {
+                      // Pass error code to Android for debugging if needed
+                      try { AndroidTime.onError(err.data); } catch (e) {}
+                    }
+                  }
+                });
+              }
+            </script>
+          </body>
+        </html>
+        """.trimIndent()
+    }
+
+    AndroidView(
+        modifier = modifier,
+        factory = { context ->
+            WebView(context).apply {
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = true
+                settings.mediaPlaybackRequiresUserGesture = false
+                settings.loadWithOverviewMode = true
+                settings.useWideViewPort = true
+
+                webChromeClient = WebChromeClient()
+                webViewClient = WebViewClient()
+
+                addJavascriptInterface(object {
+                    @JavascriptInterface
+                    fun onTime(seconds: Float) {
+                        onCurrentSecond(seconds)
+                    }
+
+                    @JavascriptInterface
+                    fun onError(code: Int) {
+                        // You can log this if you want
+                        // Example: 153, 150, 101, etc.
+                    }
+                }, "AndroidTime")
+
+                // KEY FIX: give WebView a real-ish base URL so referrer/origin is not "null"
+                val baseUrl = "https://example.com"
+                loadDataWithBaseURL(baseUrl, html, "text/html", "UTF-8", null)
+            }
+        },
+        onRelease = { it.destroy() }
+    )
+}
 }
