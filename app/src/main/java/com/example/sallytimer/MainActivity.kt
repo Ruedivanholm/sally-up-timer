@@ -31,16 +31,13 @@ import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.delay
 import java.util.Locale
 
-// ✅ Your chosen YouTube version
 private const val VIDEO_ID = "koMp3ei4xJw"
 private const val YT_URL = "https://www.youtube.com/watch?v=$VIDEO_ID"
 
-// Prefs for saved cues
 private const val PREFS = "sally_prefs"
-private const val KEY_CUES = "cues_v3"
+private const val KEY_CUES = "cues_v4"
 
-// Important for embed identity / referrer checks in some WebView embeds
-// (does not need to be a real site, but should be a valid https origin string)
+// A stable https origin string for embedder identity context
 private const val BASE_URL = "https://example.com"
 
 enum class Command { UP, DOWN }
@@ -61,16 +58,12 @@ data class Cue(val atMs: Long, val cmd: Command)
 
 private enum class Screen { WORKOUT, CALIBRATE }
 
-/* ----------------------------- Activity ----------------------------- */
-
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent { SallyApp() }
     }
 }
-
-/* ----------------------------- App Shell ---------------------------- */
 
 @Composable
 private fun SallyApp() {
@@ -114,7 +107,6 @@ private fun WorkoutScreen(
     val context = LocalContext.current
     val view = LocalView.current
 
-    // Keep screen awake during workout
     DisposableEffect(Unit) {
         view.keepScreenOn = true
         onDispose { view.keepScreenOn = false }
@@ -134,13 +126,18 @@ private fun WorkoutScreen(
         tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "sally_${System.currentTimeMillis()}")
     }
 
+    var exercise by remember { mutableStateOf(ExerciseType.PUSH_UP) }
+
     // Player state
     var playerReady by remember { mutableStateOf(false) }
     var currentSec by remember { mutableStateOf(0f) }
     var playerError by remember { mutableStateOf<Int?>(null) }
 
+    // Controller from the WebView (THIS FIXES “play hits wrong WebView”)
+    var controller by remember { mutableStateOf<YouTubeController?>(null) }
+
     // Workout state
-    var exercise by remember { mutableStateOf(ExerciseType.PUSH_UP) }
+    val hasCues = cues.isNotEmpty()
     var running by remember { mutableStateOf(false) }
     var inCountdown by remember { mutableStateOf(false) }
     var countdown by remember { mutableStateOf(3) }
@@ -149,11 +146,9 @@ private fun WorkoutScreen(
     var currentCommand by remember { mutableStateOf(Command.DOWN) }
     var lastCueIndex by remember { mutableStateOf(-1) }
 
-    // Flash background on cue changes
+    // Flash
     var flashColor by remember { mutableStateOf(Color.Transparent) }
     val animatedFlash by animateColorAsState(flashColor, label = "flash")
-
-    val hasCues = cues.isNotEmpty()
 
     suspend fun flash(cmd: Command) {
         flashColor = if (cmd == Command.UP) Color(0x334CAF50) else Color(0x33F44336)
@@ -161,27 +156,22 @@ private fun WorkoutScreen(
         flashColor = Color.Transparent
     }
 
-    // Countdown -> start playback manually
+    // Countdown -> manual start (seek+unmute+play in one JS call, no delay)
     LaunchedEffect(inCountdown) {
         if (!inCountdown) return@LaunchedEffect
-
         for (i in 3 downTo 1) {
             countdown = i
             delay(1000)
         }
-
         inCountdown = false
         running = true
         reps = 0
         lastCueIndex = -1
 
-        // Manual start: ensure we start from 0
-        WebViewController.seekTo(0f)
-        delay(200)
-        WebViewController.play()
+        controller?.playFromStart()
     }
 
-    // Drive cues from currentSec (only while running)
+    // Drive cues (only when running)
     LaunchedEffect(currentSec, running, hasCues) {
         if (!running || !hasCues) return@LaunchedEffect
 
@@ -206,7 +196,6 @@ private fun WorkoutScreen(
             .background(animatedFlash)
             .padding(16.dp)
     ) {
-        // Top section
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -218,20 +207,17 @@ private fun WorkoutScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    "Sally Up Timer",
-                    style = MaterialTheme.typography.titleLarge,
-                    fontWeight = FontWeight.SemiBold
-                )
+                Text("Sally Up Timer", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
                 Text("Reps: $reps", fontWeight = FontWeight.Bold)
             }
 
-            // ✅ 16:9 frame: video matches app frame
+            // ✅ Video fits frame (16:9)
             YouTubeIFrameWebView(
                 videoId = VIDEO_ID,
                 modifier = Modifier
                     .fillMaxWidth()
                     .aspectRatio(16 / 9f),
+                onController = { controller = it },
                 onReady = { playerReady = true },
                 onCurrentSecond = { currentSec = it },
                 onPlayerError = { playerError = it }
@@ -254,15 +240,11 @@ private fun WorkoutScreen(
             }
 
             if (playerError != null) {
-                Text(
-                    "YouTube error: $playerError (embed may be blocked).",
-                    color = MaterialTheme.colorScheme.error
-                )
+                Text("YouTube error: $playerError (embed may be restricted).", color = MaterialTheme.colorScheme.error)
                 Button(onClick = { openYouTube(context) }) { Text("Open in YouTube") }
             }
         }
 
-        // Big center display
         Column(
             modifier = Modifier.align(Alignment.Center),
             horizontalAlignment = Alignment.CenterHorizontally
@@ -287,7 +269,6 @@ private fun WorkoutScreen(
             }
         }
 
-        // Bottom controls
         Row(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
@@ -299,17 +280,13 @@ private fun WorkoutScreen(
                 enabled = playerReady && !inCountdown,
                 onClick = {
                     if (!running) {
-                        // ✅ Manual start
                         inCountdown = true
                     } else {
-                        // Pause workout + video
                         running = false
-                        WebViewController.pause()
+                        controller?.pause()
                     }
                 }
-            ) {
-                Text(if (!running) "Start (3-2-1)" else "Pause")
-            }
+            ) { Text(if (!running) "Start (3-2-1)" else "Pause") }
 
             OutlinedButton(
                 modifier = Modifier.weight(1f),
@@ -318,10 +295,7 @@ private fun WorkoutScreen(
                     inCountdown = false
                     reps = 0
                     lastCueIndex = -1
-
-                    // Reset video to start, keep paused (manual start)
-                    WebViewController.pause()
-                    WebViewController.seekTo(0f)
+                    controller?.resetPaused()
                 }
             ) { Text("Reset") }
 
@@ -345,6 +319,7 @@ private fun CalibrationScreen(onDone: () -> Unit) {
     var playerReady by remember { mutableStateOf(false) }
     var currentSec by remember { mutableStateOf(0f) }
     var playerError by remember { mutableStateOf<Int?>(null) }
+    var controller by remember { mutableStateOf<YouTubeController?>(null) }
 
     var captured by remember { mutableStateOf(listOf<Cue>()) }
     val upCount = captured.count { it.cmd == Command.UP }
@@ -359,39 +334,24 @@ private fun CalibrationScreen(onDone: () -> Unit) {
 
         YouTubeIFrameWebView(
             videoId = VIDEO_ID,
-            modifier = Modifier
-                .fillMaxWidth()
-                .aspectRatio(16 / 9f),
+            modifier = Modifier.fillMaxWidth().aspectRatio(16 / 9f),
+            onController = { controller = it },
             onReady = { playerReady = true },
             onCurrentSecond = { currentSec = it },
             onPlayerError = { playerError = it }
         )
 
         if (playerError != null) {
-            Text("YouTube error: $playerError (embed may be blocked).", color = MaterialTheme.colorScheme.error)
+            Text("YouTube error: $playerError", color = MaterialTheme.colorScheme.error)
             Button(onClick = { openYouTube(context) }) { Text("Open in YouTube") }
         }
 
         Text("Time: ${"%.1f".format(currentSec)}s   |   UP: $upCount   DOWN: $downCount")
 
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            Button(
-                modifier = Modifier.weight(1f),
-                enabled = playerReady,
-                onClick = { WebViewController.play() }
-            ) { Text("Play") }
-
-            Button(
-                modifier = Modifier.weight(1f),
-                enabled = playerReady,
-                onClick = { WebViewController.pause() }
-            ) { Text("Pause") }
-
-            OutlinedButton(
-                modifier = Modifier.weight(1f),
-                enabled = playerReady,
-                onClick = { WebViewController.seekTo(0f) }
-            ) { Text("Restart") }
+            Button(modifier = Modifier.weight(1f), enabled = playerReady, onClick = { controller?.play() }) { Text("Play") }
+            Button(modifier = Modifier.weight(1f), enabled = playerReady, onClick = { controller?.pause() }) { Text("Pause") }
+            OutlinedButton(modifier = Modifier.weight(1f), enabled = playerReady, onClick = { controller?.resetPaused() }) { Text("Restart") }
         }
 
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -411,16 +371,8 @@ private fun CalibrationScreen(onDone: () -> Unit) {
         }
 
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            OutlinedButton(
-                modifier = Modifier.weight(1f),
-                enabled = captured.isNotEmpty(),
-                onClick = { captured = captured.dropLast(1) }
-            ) { Text("Undo") }
-
-            OutlinedButton(
-                modifier = Modifier.weight(1f),
-                onClick = { captured = emptyList() }
-            ) { Text("Clear") }
+            OutlinedButton(modifier = Modifier.weight(1f), enabled = captured.isNotEmpty(), onClick = { captured = captured.dropLast(1) }) { Text("Undo") }
+            OutlinedButton(modifier = Modifier.weight(1f), onClick = { captured = emptyList() }) { Text("Clear") }
         }
 
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -433,32 +385,34 @@ private fun CalibrationScreen(onDone: () -> Unit) {
                 }
             ) { Text("Save & Exit") }
 
-            OutlinedButton(
-                modifier = Modifier.weight(1f),
-                onClick = { onDone() }
-            ) { Text("Back") }
+            OutlinedButton(modifier = Modifier.weight(1f), onClick = { onDone() }) { Text("Back") }
         }
     }
 }
 
 /* ------------------- YouTube IFrame WebView ----------------------- */
 
-// Simple controller so buttons can play/pause/seek the currently attached WebView player
-private object WebViewController {
-    private var webView: WebView? = null
-    fun attach(wv: WebView) { webView = wv }
-    fun detach() { webView = null }
-
+class YouTubeController(private val webView: WebView) {
     fun play() {
-        webView?.evaluateJavascript("try{player && player.playVideo();}catch(e){}", null)
+        // Simple play (no seek)
+        webView.evaluateJavascript("try{player && player.playVideo(); player && player.unMute && player.unMute();}catch(e){}", null)
     }
 
     fun pause() {
-        webView?.evaluateJavascript("try{player && player.pauseVideo();}catch(e){}", null)
+        webView.evaluateJavascript("try{player && player.pauseVideo();}catch(e){}", null)
     }
 
-    fun seekTo(seconds: Float) {
-        webView?.evaluateJavascript("try{player && player.seekTo($seconds,true);}catch(e){}", null)
+    fun resetPaused() {
+        // Park at 0 and pause (manual start)
+        webView.evaluateJavascript("try{player && player.seekTo(0,true); player && player.pauseVideo();}catch(e){}", null)
+    }
+
+    fun playFromStart() {
+        // ✅ Critical: do seek+unmute+play in ONE JS execution (more reliable)
+        webView.evaluateJavascript(
+            "try{player && player.seekTo(0,true); player && player.unMute && player.unMute(); player && player.playVideo();}catch(e){}",
+            null
+        )
     }
 }
 
@@ -467,6 +421,7 @@ private object WebViewController {
 private fun YouTubeIFrameWebView(
     videoId: String,
     modifier: Modifier = Modifier,
+    onController: (YouTubeController) -> Unit = {},
     onReady: () -> Unit = {},
     onCurrentSecond: (Float) -> Unit = {},
     onPlayerError: (Int) -> Unit = {}
@@ -494,7 +449,7 @@ private fun YouTubeIFrameWebView(
                 player = new YT.Player('player', {
                   videoId: '$videoId',
                   playerVars: {
-                    autoplay: 0,                 // ✅ MANUAL START (no autoplay)
+                    autoplay: 0,
                     controls: 1,
                     playsinline: 1,
                     enablejsapi: 1,
@@ -505,12 +460,9 @@ private fun YouTubeIFrameWebView(
                   events: {
                     onReady: function(e) {
                       try { AndroidBridge.onReady(); } catch (err) {}
-
-                      // ✅ BONUS: park the video at 0 and force pause
                       try { e.target.seekTo(0, true); } catch (err) {}
                       try { e.target.pauseVideo(); } catch (err) {}
 
-                      // Time callback ~5x/sec
                       setInterval(function() {
                         try {
                           var t = player.getCurrentTime();
@@ -534,8 +486,7 @@ private fun YouTubeIFrameWebView(
         modifier = modifier,
         factory = { context ->
             WebView(context).apply {
-                WebViewController.attach(this)
-
+                // Settings
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
                 settings.mediaPlaybackRequiresUserGesture = false
@@ -543,27 +494,26 @@ private fun YouTubeIFrameWebView(
                 settings.useWideViewPort = true
                 settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
 
-                // Optional: more reliable on some devices
+                // Cookies help YouTube embeds on some devices
                 CookieManager.getInstance().setAcceptCookie(true)
                 CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
 
                 webChromeClient = WebChromeClient()
                 webViewClient = WebViewClient()
 
+                // Provide controller for this exact WebView instance
+                onController(YouTubeController(this))
+
                 addJavascriptInterface(object {
-                    @JavascriptInterface fun onReady() { onReady() }
-                    @JavascriptInterface fun onTime(seconds: Float) { onCurrentSecond(seconds) }
-                    @JavascriptInterface fun onError(code: Int) { onPlayerError(code) }
+                    @JavascriptInterface fun onReady() = onReady()
+                    @JavascriptInterface fun onTime(seconds: Float) = onCurrentSecond(seconds)
+                    @JavascriptInterface fun onError(code: Int) = onPlayerError(code)
                 }, "AndroidBridge")
 
-                // Base URL provides a valid origin context for the iframe
                 loadDataWithBaseURL(BASE_URL, html, "text/html", "UTF-8", null)
             }
         },
-        onRelease = {
-            WebViewController.detach()
-            it.destroy()
-        }
+        onRelease = { it.destroy() }
     )
 }
 
