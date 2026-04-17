@@ -6,8 +6,10 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
+import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
+import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
@@ -28,15 +30,17 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.delay
 import java.util.Locale
-import kotlin.math.max
 
+// ✅ Your chosen YouTube version
 private const val VIDEO_ID = "koMp3ei4xJw"
 private const val YT_URL = "https://www.youtube.com/watch?v=$VIDEO_ID"
-private const val PREFS = "sally_prefs"
-private const val KEY_CUES = "cues_v2"
 
-// Set a realistic base URL for the WebView so origin/referrer isn't "null".
-// This is commonly required for modern YouTube embeds that enforce embedder identity checks. [1](https://rokslide.com/forums/threads/sally-push-up-challenge.250690/)[2](https://www.youtube.com/watch?v=4xqdCYXOdvs)
+// Prefs for saved cues
+private const val PREFS = "sally_prefs"
+private const val KEY_CUES = "cues_v3"
+
+// Important for embed identity / referrer checks in some WebView embeds
+// (does not need to be a real site, but should be a valid https origin string)
 private const val BASE_URL = "https://example.com"
 
 enum class Command { UP, DOWN }
@@ -57,12 +61,16 @@ data class Cue(val atMs: Long, val cmd: Command)
 
 private enum class Screen { WORKOUT, CALIBRATE }
 
+/* ----------------------------- Activity ----------------------------- */
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent { SallyApp() }
     }
 }
+
+/* ----------------------------- App Shell ---------------------------- */
 
 @Composable
 private fun SallyApp() {
@@ -95,7 +103,7 @@ private fun AppNav() {
     }
 }
 
-/* ----------------------------- WORKOUT SCREEN ----------------------------- */
+/* ------------------------- Workout Screen -------------------------- */
 
 @Composable
 private fun WorkoutScreen(
@@ -106,13 +114,13 @@ private fun WorkoutScreen(
     val context = LocalContext.current
     val view = LocalView.current
 
-    // Keep screen on (gym-friendly)
+    // Keep screen awake during workout
     DisposableEffect(Unit) {
         view.keepScreenOn = true
         onDispose { view.keepScreenOn = false }
     }
 
-    // TTS for Up/Down (toggleable)
+    // TTS
     var voiceEnabled by remember { mutableStateOf(false) }
     var tts by remember { mutableStateOf<TextToSpeech?>(null) }
     DisposableEffect(Unit) {
@@ -126,28 +134,25 @@ private fun WorkoutScreen(
         tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "sally_${System.currentTimeMillis()}")
     }
 
-    var exercise by remember { mutableStateOf(ExerciseType.PUSH_UP) }
-
-    // WebView player state
-    var currentSec by remember { mutableStateOf(0f) }
+    // Player state
     var playerReady by remember { mutableStateOf(false) }
-    var lastPlayerError by remember { mutableStateOf<Int?>(null) }
+    var currentSec by remember { mutableStateOf(0f) }
+    var playerError by remember { mutableStateOf<Int?>(null) }
 
-    // Countdown + control state
+    // Workout state
+    var exercise by remember { mutableStateOf(ExerciseType.PUSH_UP) }
+    var running by remember { mutableStateOf(false) }
     var inCountdown by remember { mutableStateOf(false) }
     var countdown by remember { mutableStateOf(3) }
-    var running by remember { mutableStateOf(false) }
 
-    // Cue-driven state
     var reps by remember { mutableStateOf(0) }
     var currentCommand by remember { mutableStateOf(Command.DOWN) }
     var lastCueIndex by remember { mutableStateOf(-1) }
 
-    // Flash background on cue change
+    // Flash background on cue changes
     var flashColor by remember { mutableStateOf(Color.Transparent) }
     val animatedFlash by animateColorAsState(flashColor, label = "flash")
 
-    // If no cues saved, force calibrate suggestion
     val hasCues = cues.isNotEmpty()
 
     suspend fun flash(cmd: Command) {
@@ -156,24 +161,27 @@ private fun WorkoutScreen(
         flashColor = Color.Transparent
     }
 
-    // Handle countdown start
+    // Countdown -> start playback manually
     LaunchedEffect(inCountdown) {
         if (!inCountdown) return@LaunchedEffect
+
         for (i in 3 downTo 1) {
             countdown = i
-            // Optional spoken countdown (leave off by default; you can turn voice on)
             delay(1000)
         }
+
         inCountdown = false
         running = true
         reps = 0
         lastCueIndex = -1
-        // Seek to start and play (JS calls)
+
+        // Manual start: ensure we start from 0
         WebViewController.seekTo(0f)
+        delay(200)
         WebViewController.play()
     }
 
-    // Drive cues based on currentSec (from the WebView IFrame API clock)
+    // Drive cues from currentSec (only while running)
     LaunchedEffect(currentSec, running, hasCues) {
         if (!running || !hasCues) return@LaunchedEffect
 
@@ -192,7 +200,6 @@ private fun WorkoutScreen(
         }
     }
 
-    // Build UI
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -212,25 +219,24 @@ private fun WorkoutScreen(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    "Sally Up Timer (YouTube sync)",
+                    "Sally Up Timer",
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.SemiBold
                 )
                 Text("Reps: $reps", fontWeight = FontWeight.Bold)
             }
 
-            // YouTube player (WebView + IFrame API)
+            // ✅ 16:9 frame: video matches app frame
             YouTubeIFrameWebView(
                 videoId = VIDEO_ID,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(210.dp),
+                    .aspectRatio(16 / 9f),
                 onReady = { playerReady = true },
-                onCurrentSecond = { sec -> currentSec = sec },
-                onPlayerError = { code -> lastPlayerError = code },
+                onCurrentSecond = { currentSec = it },
+                onPlayerError = { playerError = it }
             )
 
-            // Controls row
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -247,15 +253,12 @@ private fun WorkoutScreen(
                 }
             }
 
-            // If embed fails, show a clear fallback
-            if (lastPlayerError != null) {
+            if (playerError != null) {
                 Text(
-                    "Player error: ${lastPlayerError}. If you see 'Watch on YouTube / Error 153', use the button below.",
+                    "YouTube error: $playerError (embed may be blocked).",
                     color = MaterialTheme.colorScheme.error
                 )
-                Button(onClick = { openYouTube(context) }) {
-                    Text("Open in YouTube")
-                }
+                Button(onClick = { openYouTube(context) }) { Text("Open in YouTube") }
             }
         }
 
@@ -265,15 +268,15 @@ private fun WorkoutScreen(
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             when {
-                !hasCues -> {
-                    Text("No timing saved yet", fontSize = 26.sp, fontWeight = FontWeight.Bold)
-                    Spacer(Modifier.height(8.dp))
-                    Text("Tap Calibrate to record UP/DOWN timing for this video.")
-                }
                 inCountdown -> {
                     Text(countdown.toString(), fontSize = 120.sp, fontWeight = FontWeight.Black)
                     Spacer(Modifier.height(8.dp))
                     Text("Get ready…")
+                }
+                !hasCues -> {
+                    Text("No timing saved yet", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(8.dp))
+                    Text("Tap Calibrate to record UP/DOWN timing.")
                 }
                 else -> {
                     val label = if (currentCommand == Command.UP) exercise.upText else exercise.downText
@@ -284,7 +287,7 @@ private fun WorkoutScreen(
             }
         }
 
-        // Bottom buttons
+        // Bottom controls
         Row(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
@@ -293,18 +296,20 @@ private fun WorkoutScreen(
         ) {
             Button(
                 modifier = Modifier.weight(1f),
-                enabled = hasCues && playerReady && !inCountdown,
+                enabled = playerReady && !inCountdown,
                 onClick = {
                     if (!running) {
-                        // fresh start => countdown
+                        // ✅ Manual start
                         inCountdown = true
                     } else {
-                        // pause
+                        // Pause workout + video
                         running = false
                         WebViewController.pause()
                     }
                 }
-            ) { Text(if (!running) "Start (3-2-1)" else "Pause") }
+            ) {
+                Text(if (!running) "Start (3-2-1)" else "Pause")
+            }
 
             OutlinedButton(
                 modifier = Modifier.weight(1f),
@@ -313,6 +318,8 @@ private fun WorkoutScreen(
                     inCountdown = false
                     reps = 0
                     lastCueIndex = -1
+
+                    // Reset video to start, keep paused (manual start)
                     WebViewController.pause()
                     WebViewController.seekTo(0f)
                 }
@@ -329,14 +336,15 @@ private fun WorkoutScreen(
     }
 }
 
-/* --------------------------- CALIBRATION SCREEN --------------------------- */
+/* ----------------------- Calibration Screen ------------------------ */
 
 @Composable
 private fun CalibrationScreen(onDone: () -> Unit) {
     val context = LocalContext.current
-    var currentSec by remember { mutableStateOf(0f) }
+
     var playerReady by remember { mutableStateOf(false) }
-    var lastPlayerError by remember { mutableStateOf<Int?>(null) }
+    var currentSec by remember { mutableStateOf(0f) }
+    var playerError by remember { mutableStateOf<Int?>(null) }
 
     var captured by remember { mutableStateOf(listOf<Cue>()) }
     val upCount = captured.count { it.cmd == Command.UP }
@@ -347,24 +355,20 @@ private fun CalibrationScreen(onDone: () -> Unit) {
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         Text("Calibration", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
-        Text(
-            "Press Play, then tap Mark UP/DOWN on each cue. Save when done. Aim for 30 UP taps.",
-            style = MaterialTheme.typography.bodyMedium
-        )
+        Text("Press Play, then tap Mark UP/DOWN on each cue. Save when done. Aim for 30 UP taps.")
 
         YouTubeIFrameWebView(
             videoId = VIDEO_ID,
-            modifier = Modifier.fillMaxWidth().height(210.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(16 / 9f),
             onReady = { playerReady = true },
             onCurrentSecond = { currentSec = it },
-            onPlayerError = { code -> lastPlayerError = code }
+            onPlayerError = { playerError = it }
         )
 
-        if (lastPlayerError != null) {
-            Text(
-                "Player error: ${lastPlayerError}. If you see Error 153, embed is blocked. Use Open in YouTube and calibrate manually by time.",
-                color = MaterialTheme.colorScheme.error
-            )
+        if (playerError != null) {
+            Text("YouTube error: $playerError (embed may be blocked).", color = MaterialTheme.colorScheme.error)
             Button(onClick = { openYouTube(context) }) { Text("Open in YouTube") }
         }
 
@@ -393,20 +397,16 @@ private fun CalibrationScreen(onDone: () -> Unit) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             Button(
                 modifier = Modifier.weight(1f),
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)),
                 enabled = playerReady,
-                onClick = {
-                    captured = captured + Cue((currentSec * 1000).toLong(), Command.UP)
-                }
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)),
+                onClick = { captured = captured + Cue((currentSec * 1000).toLong(), Command.UP) }
             ) { Text("Mark UP") }
 
             Button(
                 modifier = Modifier.weight(1f),
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFC62828)),
                 enabled = playerReady,
-                onClick = {
-                    captured = captured + Cue((currentSec * 1000).toLong(), Command.DOWN)
-                }
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFC62828)),
+                onClick = { captured = captured + Cue((currentSec * 1000).toLong(), Command.DOWN) }
             ) { Text("Mark DOWN") }
         }
 
@@ -428,8 +428,7 @@ private fun CalibrationScreen(onDone: () -> Unit) {
                 modifier = Modifier.weight(1f),
                 enabled = captured.isNotEmpty(),
                 onClick = {
-                    val sorted = captured.sortedBy { it.atMs }
-                    saveCues(context, sorted)
+                    saveCues(context, captured.sortedBy { it.atMs })
                     onDone()
                 }
             ) { Text("Save & Exit") }
@@ -442,15 +441,9 @@ private fun CalibrationScreen(onDone: () -> Unit) {
     }
 }
 
-/* -------------------------- YOUTUBE IFRAME WEBVIEW ------------------------- */
+/* ------------------- YouTube IFrame WebView ----------------------- */
 
-/**
- * WebView + YouTube IFrame API approach.
- * This allows us to set a base URL + referrer policy which can mitigate embedder identity/config errors
- * seen in modern YouTube embeds (e.g. Error 153 / 152-4). [1](https://rokslide.com/forums/threads/sally-push-up-challenge.250690/)[2](https://www.youtube.com/watch?v=4xqdCYXOdvs)[3](https://www.youtube.com/watch?v=ngWF3dqBI44)
- *
- * Note: This uses YouTube’s IFrame API, which is designed for embedded playback controlled via JS. [3](https://www.youtube.com/watch?v=ngWF3dqBI44)
- */
+// Simple controller so buttons can play/pause/seek the currently attached WebView player
 private object WebViewController {
     private var webView: WebView? = null
     fun attach(wv: WebView) { webView = wv }
@@ -479,7 +472,6 @@ private fun YouTubeIFrameWebView(
     onPlayerError: (Int) -> Unit = {}
 ) {
     val html = remember(videoId) {
-        // Use YouTube IFrame API script. [3](https://www.youtube.com/watch?v=ngWF3dqBI44)
         """
         <!DOCTYPE html>
         <html>
@@ -502,7 +494,7 @@ private fun YouTubeIFrameWebView(
                 player = new YT.Player('player', {
                   videoId: '$videoId',
                   playerVars: {
-                    autoplay: 1,
+                    autoplay: 0,                 // ✅ MANUAL START (no autoplay)
                     controls: 1,
                     playsinline: 1,
                     enablejsapi: 1,
@@ -513,8 +505,12 @@ private fun YouTubeIFrameWebView(
                   events: {
                     onReady: function(e) {
                       try { AndroidBridge.onReady(); } catch (err) {}
-                      e.target.playVideo();
 
+                      // ✅ BONUS: park the video at 0 and force pause
+                      try { e.target.seekTo(0, true); } catch (err) {}
+                      try { e.target.pauseVideo(); } catch (err) {}
+
+                      // Time callback ~5x/sec
                       setInterval(function() {
                         try {
                           var t = player.getCurrentTime();
@@ -545,6 +541,11 @@ private fun YouTubeIFrameWebView(
                 settings.mediaPlaybackRequiresUserGesture = false
                 settings.loadWithOverviewMode = true
                 settings.useWideViewPort = true
+                settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+
+                // Optional: more reliable on some devices
+                CookieManager.getInstance().setAcceptCookie(true)
+                CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
 
                 webChromeClient = WebChromeClient()
                 webViewClient = WebViewClient()
@@ -555,7 +556,7 @@ private fun YouTubeIFrameWebView(
                     @JavascriptInterface fun onError(code: Int) { onPlayerError(code) }
                 }, "AndroidBridge")
 
-                // KEY: load with a base URL so the iframe has a meaningful origin context. [1](https://rokslide.com/forums/threads/sally-push-up-challenge.250690/)[2](https://www.youtube.com/watch?v=4xqdCYXOdvs)
+                // Base URL provides a valid origin context for the iframe
                 loadDataWithBaseURL(BASE_URL, html, "text/html", "UTF-8", null)
             }
         },
@@ -566,7 +567,7 @@ private fun YouTubeIFrameWebView(
     )
 }
 
-/* ---------------------------- SMALL UI HELPERS ---------------------------- */
+/* ---------------------- Small UI helpers -------------------------- */
 
 @Composable
 private fun ExerciseDropdown(current: ExerciseType, onSelect: (ExerciseType) -> Unit) {
@@ -585,14 +586,12 @@ private fun ExerciseDropdown(current: ExerciseType, onSelect: (ExerciseType) -> 
 }
 
 private fun openYouTube(context: Context) {
-    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(YT_URL))
-    context.startActivity(intent)
+    context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(YT_URL)))
 }
 
-/* ------------------------- CUE SAVE/LOAD (Prefs) -------------------------- */
+/* ----------------------- Save/Load cues --------------------------- */
 
 private fun saveCues(context: Context, cues: List<Cue>) {
-    // Format: "ms:UP;ms:DOWN;..."
     val s = cues.joinToString(";") { "${it.atMs}:${it.cmd.name}" }
     context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         .edit()
