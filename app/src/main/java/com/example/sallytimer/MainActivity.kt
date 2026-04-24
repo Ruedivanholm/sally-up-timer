@@ -42,10 +42,6 @@ private fun Mp3PlayerApp() {
     }
 }
 
-/**
- * Holds MediaPlayer + all diagnostic state.
- * This avoids “silent failure” and makes it obvious if start() is being called / failing.
- */
 private class PlayerHolder {
     private var mp: MediaPlayer? = null
 
@@ -72,7 +68,6 @@ private class PlayerHolder {
 
         try {
             mp = MediaPlayer().apply {
-                // Make sure Android treats this as MEDIA playback (helps Samsung quirks)
                 setAudioAttributes(
                     AudioAttributes.Builder()
                         .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -109,12 +104,8 @@ private class PlayerHolder {
         }
     }
 
-    /**
-     * Returns true if we successfully started playback.
-     */
     fun playFromStart(): Boolean {
-        val p = mp
-        if (p == null) {
+        val p = mp ?: run {
             lastError = "Start requested but MediaPlayer is null"
             lastEvent = "Error"
             return false
@@ -124,7 +115,6 @@ private class PlayerHolder {
             lastEvent = "Error"
             return false
         }
-
         return try {
             lastError = null
             lastEvent = "Starting…"
@@ -141,9 +131,13 @@ private class PlayerHolder {
     }
 
     fun play(): Boolean {
-        val p = mp
-        if (p == null || !prepared) {
-            lastError = "Resume requested but player not ready"
+        val p = mp ?: run {
+            lastError = "Resume requested but MediaPlayer is null"
+            lastEvent = "Error"
+            return false
+        }
+        if (!prepared) {
+            lastError = "Resume requested but not prepared yet"
             lastEvent = "Error"
             return false
         }
@@ -173,9 +167,13 @@ private class PlayerHolder {
     }
 
     fun resetToStartPaused() {
-        val p = mp
-        if (p == null || !prepared) {
-            lastError = "Reset requested but player not ready"
+        val p = mp ?: run {
+            lastError = "Reset requested but MediaPlayer is null"
+            lastEvent = "Error"
+            return
+        }
+        if (!prepared) {
+            lastError = "Reset requested but not prepared yet"
             lastEvent = "Error"
             return
         }
@@ -202,7 +200,6 @@ private fun Step1Screen() {
     val context = LocalContext.current
     val view = LocalView.current
 
-    // Keep screen awake (gym-friendly)
     DisposableEffect(Unit) {
         view.keepScreenOn = true
         onDispose { view.keepScreenOn = false }
@@ -213,28 +210,21 @@ private fun Step1Screen() {
 
     var audioUri by remember { mutableStateOf(loadAudioUri(context)) }
 
-    // UI clock state
+    // Debug: show the selected URI as text
+    val uriText = audioUri?.toString() ?: "(none)"
+
     var currentMs by remember { mutableStateOf(0L) }
     var durationMs by remember { mutableStateOf(0L) }
     var playing by remember { mutableStateOf(false) }
 
-    // Pick MP3
-    val pickAudio = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+    // ✅ More robust on Samsung: GetContent
+    val pickAudio = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri != null) {
-            try {
-                context.contentResolver.takePersistableUriPermission(
-                    uri,
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION
-                )
-            } catch (_: SecurityException) {
-                // Some providers don't allow persist; still may work for this session.
-            }
             audioUri = uri
             saveAudioUri(context, uri)
         }
     }
 
-    // Load MP3 when URI changes
     LaunchedEffect(audioUri) {
         player.load(context, audioUri)
         currentMs = 0L
@@ -242,7 +232,6 @@ private fun Step1Screen() {
         playing = false
     }
 
-    // Update clock & “isPlaying”
     LaunchedEffect(Unit) {
         while (true) {
             if (player.prepared) {
@@ -258,7 +247,6 @@ private fun Step1Screen() {
         }
     }
 
-    // Countdown
     var inCountdown by remember { mutableStateOf(false) }
     var countdown by remember { mutableStateOf(3) }
 
@@ -278,13 +266,10 @@ private fun Step1Screen() {
     ) {
         Text("Step 1 — MP3 Playback (Diagnostics)", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
 
-        // Status line (THIS is what we’ll use for fault-finding)
-        Text(
-            "Status: ${player.lastEvent}",
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
+        Text("Selected URI: $uriText", color = MaterialTheme.colorScheme.onSurfaceVariant)
 
-        // Error line (only shows if something went wrong)
+        Text("Status: ${player.lastEvent}", color = MaterialTheme.colorScheme.onSurfaceVariant)
+
         if (player.lastError != null) {
             Text(
                 "Error: ${player.lastError}",
@@ -294,7 +279,7 @@ private fun Step1Screen() {
         }
 
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            Button(onClick = { pickAudio.launch(arrayOf("audio/*")) }) {
+            Button(onClick = { pickAudio.launch("audio/*") }) {
                 Text(if (audioUri == null) "Pick MP3" else "Change MP3")
             }
 
@@ -310,10 +295,7 @@ private fun Step1Screen() {
             }
         }
 
-        Text(
-            "Time: ${formatMs(currentMs)} / ${formatMs(durationMs)}",
-            fontWeight = FontWeight.SemiBold
-        )
+        Text("Time: ${formatMs(currentMs)} / ${formatMs(durationMs)}", fontWeight = FontWeight.SemiBold)
 
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             Button(
@@ -335,11 +317,11 @@ private fun Step1Screen() {
         }
 
         Divider()
-
-        Text("What to report back to me:", fontWeight = FontWeight.SemiBold)
-        Text("1) After picking MP3: does Status become “Prepared ✓ (paused at start)”?")
-        Text("2) After pressing Start: does Status become “Playing…”? Does time/duration update?")
-        Text("3) If Error appears, paste the exact Error line.")
+        Text("Report back:", fontWeight = FontWeight.SemiBold)
+        Text("• After picking MP3: what does Selected URI show?")
+        Text("• Status after picking MP3?")
+        Text("• Status after Start?")
+        Text("• Any Error line?")
     }
 }
 
