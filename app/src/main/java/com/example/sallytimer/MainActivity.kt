@@ -2,13 +2,14 @@ package com.example.sallytimer
 
 import android.content.Context
 import android.content.Intent
+import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -41,239 +42,138 @@ private fun Mp3PlayerApp() {
     }
 }
 
+/**
+ * Holds MediaPlayer + all diagnostic state.
+ * This avoids “silent failure” and makes it obvious if start() is being called / failing.
+ */
 private class PlayerHolder {
     private var mp: MediaPlayer? = null
-    private var prepared = false
 
-    fun isPrepared() = prepared
-    fun isPlaying() = mp?.isPlaying == true
+    var prepared: Boolean = false
+        private set
+
+    var lastError: String? = null
+        private set
+
+    var lastEvent: String = "Pick MP3 to begin"
+        private set
+
+    fun isPlaying(): Boolean = mp?.isPlaying == true
     fun currentPositionMs(): Long = mp?.currentPosition?.toLong() ?: 0L
     fun durationMs(): Long = mp?.duration?.toLong() ?: 0L
 
-    fun load(context: Context, uri: Uri?, onPrepared: () -> Unit, onComplete: () -> Unit) {
+    fun load(context: Context, uri: Uri?) {
         release()
         prepared = false
+        lastError = null
+        lastEvent = if (uri == null) "Pick MP3 to begin" else "Loading…"
+
         if (uri == null) return
 
-        mp = MediaPlayer().apply {
-            setDataSource(context, uri)
-            setOnPreparedListener {
-                prepared = true
-                pause()
-                seekTo(0)
-                onPrepared()
+        try {
+            mp = MediaPlayer().apply {
+                // Make sure Android treats this as MEDIA playback (helps Samsung quirks)
+                setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build()
+                )
+
+                setOnErrorListener { _, what, extra ->
+                    prepared = false
+                    lastError = "MediaPlayer error what=$what extra=$extra"
+                    lastEvent = "Error"
+                    true
+                }
+
+                setOnPreparedListener {
+                    prepared = true
+                    lastError = null
+                    lastEvent = "Prepared ✓ (paused at start)"
+                    pause()
+                    seekTo(0)
+                }
+
+                setOnCompletionListener {
+                    lastEvent = "Finished"
+                }
+
+                setDataSource(context, uri)
+                prepareAsync()
             }
-            setOnCompletionListener {
-                onComplete()
-            }
-            prepareAsync()
+        } catch (e: Exception) {
+            prepared = false
+            lastError = "Load exception: ${e.javaClass.simpleName}: ${e.message}"
+            lastEvent = "Error"
         }
     }
 
-    fun playFromStart() {
-        mp?.let {
-            it.seekTo(0)
-            it.start()
+    /**
+     * Returns true if we successfully started playback.
+     */
+    fun playFromStart(): Boolean {
+        val p = mp
+        if (p == null) {
+            lastError = "Start requested but MediaPlayer is null"
+            lastEvent = "Error"
+            return false
+        }
+        if (!prepared) {
+            lastError = "Start requested but not prepared yet"
+            lastEvent = "Error"
+            return false
+        }
+
+        return try {
+            lastError = null
+            lastEvent = "Starting…"
+            p.seekTo(0)
+            p.start()
+            lastEvent = "Playing…"
+            true
+        } catch (e: Exception) {
+            lastError = "Start exception: ${e.javaClass.simpleName}: ${e.message}"
+            lastEvent = "Error"
+            prepared = false
+            false
         }
     }
 
-    fun play() {
-        mp?.start()
+    fun play(): Boolean {
+        val p = mp
+        if (p == null || !prepared) {
+            lastError = "Resume requested but player not ready"
+            lastEvent = "Error"
+            return false
+        }
+        return try {
+            lastError = null
+            p.start()
+            lastEvent = "Playing…"
+            true
+        } catch (e: Exception) {
+            lastError = "Resume exception: ${e.javaClass.simpleName}: ${e.message}"
+            lastEvent = "Error"
+            false
+        }
     }
 
     fun pause() {
-        if (mp?.isPlaying == true) mp?.pause()
+        val p = mp ?: return
+        if (p.isPlaying) {
+            try {
+                p.pause()
+                lastEvent = "Paused"
+            } catch (e: Exception) {
+                lastError = "Pause exception: ${e.javaClass.simpleName}: ${e.message}"
+                lastEvent = "Error"
+            }
+        }
     }
 
     fun resetToStartPaused() {
-        mp?.seekTo(0)
-        pause()
-    }
-
-    fun release() {
-        try { mp?.release() } catch (_: Exception) {}
-        mp = null
-        prepared = false
-    }
-}
-
-@Composable
-private fun Step1Screen() {
-    val context = LocalContext.current
-    val view = LocalView.current
-
-    // Keep screen awake (gym-friendly)
-    DisposableEffect(Unit) {
-        view.keepScreenOn = true
-        onDispose { view.keepScreenOn = false }
-    }
-
-    var audioUri by remember { mutableStateOf(loadAudioUri(context)) }
-    var status by remember { mutableStateOf("") }
-
-    val playerHolder = remember { PlayerHolder() }
-    DisposableEffect(Unit) { onDispose { playerHolder.release() } }
-
-    var prepared by remember { mutableStateOf(false) }
-    var playing by remember { mutableStateOf(false) }
-
-    var currentMs by remember { mutableStateOf(0L) }
-    var durationMs by remember { mutableStateOf(0L) }
-
-    // File picker
-    val pickAudio = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) {
-            try {
-                context.contentResolver.takePersistableUriPermission(
-                    uri,
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION
-                )
-            } catch (_: SecurityException) {
-                // Some providers don’t allow persist; still usually works for this session.
-            }
-            audioUri = uri
-            saveAudioUri(context, uri)
-        }
-    }
-
-    // Load audio when audioUri changes
-    LaunchedEffect(audioUri) {
-        prepared = false
-        playing = false
-        currentMs = 0L
-        durationMs = 0L
-
-        playerHolder.load(
-            context = context,
-            uri = audioUri,
-            onPrepared = {
-                prepared = true
-                durationMs = playerHolder.durationMs()
-                status = "Loaded ✓ (paused at start)"
-            },
-            onComplete = {
-                playing = false
-                status = "Finished"
-            }
-        )
-        if (audioUri == null) status = "Pick an MP3 to begin"
-    }
-
-    // Clock updates
-    LaunchedEffect(Unit) {
-        while (true) {
-            if (prepared) {
-                currentMs = playerHolder.currentPositionMs()
-                durationMs = max(durationMs, playerHolder.durationMs())
-                playing = playerHolder.isPlaying()
-            }
-            delay(100)
-        }
-    }
-
-    // Countdown / manual start
-    var inCountdown by remember { mutableStateOf(false) }
-    var countdown by remember { mutableStateOf(3) }
-
-    LaunchedEffect(inCountdown) {
-        if (!inCountdown) return@LaunchedEffect
-        for (i in 3 downTo 1) {
-            countdown = i
-            delay(1000)
-        }
-        inCountdown = false
-        status = "Playing…"
-        playerHolder.playFromStart()
-    }
-
-    Column(
-        modifier = Modifier.fillMaxSize().padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        Text("Step 1 — MP3 Playback", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
-
-        if (status.isNotBlank()) {
-            Text(status, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            Button(onClick = { pickAudio.launch(arrayOf("audio/*")) }) {
-                Text(if (audioUri == null) "Pick MP3" else "Change MP3")
-            }
-
-            OutlinedButton(
-                enabled = prepared,
-                onClick = {
-                    playerHolder.resetToStartPaused()
-                    status = "Reset to start (paused)"
-                }
-            ) { Text("Reset") }
-        }
-
-        // Big countdown display
-        if (inCountdown) {
-            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-                Text(countdown.toString(), fontSize = 120.sp, fontWeight = FontWeight.Black)
-            }
-        }
-
-        // Time display
-        Text(
-            "Time: ${formatMs(currentMs)} / ${formatMs(durationMs)}",
-            fontWeight = FontWeight.SemiBold
-        )
-
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            Button(
-                enabled = prepared && !inCountdown,
-                onClick = {
-                    if (!playing) {
-                        // Manual Start (3-2-1)
-                        inCountdown = true
-                        countdown = 3
-                        status = "Starting…"
-                    } else {
-                        playerHolder.pause()
-                        status = "Paused"
-                    }
-                }
-            ) { Text(if (!playing) "Start (3-2-1)" else "Pause") }
-
-            OutlinedButton(
-                enabled = prepared && !inCountdown,
-                onClick = {
-                    playerHolder.play()
-                    status = "Playing…"
-                }
-            ) { Text("Resume") }
-        }
-
-        Divider()
-
-        Text(
-            "Next steps:",
-            fontWeight = FontWeight.SemiBold
-        )
-        Text("• Step 2: Add manual UP/DOWN buttons + save cue timestamps")
-        Text("• Step 3: Add auto-detect (mic) as an optional helper")
-    }
-}
-
-private fun formatMs(ms: Long): String {
-    val totalSec = max(0L, ms) / 1000
-    val m = totalSec / 60
-    val s = totalSec % 60
-    return "%d:%02d".format(m, s)
-}
-
-private fun loadAudioUri(context: Context): Uri? {
-    val s = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_AUDIO_URI, null)
-    return s?.let { Uri.parse(it) }
-}
-
-private fun saveAudioUri(context: Context, uri: Uri) {
-    context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        .edit()
-        .putString(KEY_AUDIO_URI, uri.toString())
-        .apply()
-}
+        val p = mp
+        if (p == null || !prepared) {
+            lastError = "Reset requested but player not ready"
+            lastEvent = "Error"
